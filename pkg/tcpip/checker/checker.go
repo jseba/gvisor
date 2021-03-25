@@ -61,9 +61,6 @@ func IPv4(t *testing.T, b []byte, checkers ...NetworkChecker) {
 	for _, f := range checkers {
 		f(t, []header.Network{ipv4})
 	}
-	if t.Failed() {
-		t.FailNow()
-	}
 }
 
 // IPv6 checks the validity and properties of the given IPv6 packet. The usage
@@ -418,9 +415,6 @@ func TCP(checkers ...TransportChecker) NetworkChecker {
 		for _, f := range checkers {
 			f(t, tcp)
 		}
-		if t.Failed() {
-			t.FailNow()
-		}
 	}
 }
 
@@ -480,6 +474,23 @@ func NoChecksum(noChecksum bool) TransportChecker {
 
 		if b := udp.Checksum() == 0; b != noChecksum {
 			t.Errorf("bad checksum state, got %t, want %t", b, noChecksum)
+		}
+	}
+}
+
+// Checksum returns a checker that checks if the checksum is the specified
+// value.
+func Checksum(v uint16) TransportChecker {
+	return func(t *testing.T, h header.Transport) {
+		t.Helper()
+
+		udp, ok := h.(header.UDP)
+		if !ok {
+			t.Fatalf("got h = %T, want = header.UDP", h)
+		}
+
+		if c := udp.Checksum(); c != v {
+			t.Errorf("got udp.Checksum() = %d, want = %d", c, v)
 		}
 	}
 }
