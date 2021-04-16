@@ -959,10 +959,18 @@ func (e *endpoint) forwardPacket(pkt *stack.PacketBuffer) tcpip.Error {
 	}
 
 	r, err := e.protocol.stack.FindRoute(0, "", dstAddr, ProtocolNumber, false /* multicastLoop */)
-	if err != nil {
+	switch err.(type) {
+	case nil:
+	case *tcpip.ErrNoRoute:
+		return e.protocol.returnError(&icmpReasonNetUnreachable{}, pkt)
+	default:
 		return err
 	}
 	defer r.Release()
+
+	if packetMustBeFragmented(pkt, e.MTU(), nil /* gso */) {
+		return e.protocol.returnError(&icmpReasonCantFragment{}, pkt)
+	}
 
 	// We need to do a deep copy of the IP packet because
 	// WriteHeaderIncludedPacket takes ownership of the packet buffer, but we do

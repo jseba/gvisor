@@ -354,6 +354,19 @@ func (*ErrNetworkUnreachable) IgnoreStats() bool {
 }
 func (*ErrNetworkUnreachable) String() string { return "network is unreachable" }
 
+// ErrCantFragment indicates that the packet requires fragmentation but Don't
+// Fragment has been set.
+//
+// +stateify savable
+type ErrCantFragment struct{}
+
+func (*ErrCantFragment) isError() {}
+
+// IgnoreStats implements Error.
+func (*ErrCantFragment) IgnoreStats() bool { return false }
+
+func (*ErrCantFragment) String() string { return "fragmentation is required but DF is set" }
+
 // ErrNoBufferSpace indicates no buffer space is available.
 //
 // +stateify savable

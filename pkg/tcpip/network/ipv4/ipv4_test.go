@@ -131,10 +131,26 @@ func TestForwarding(t *testing.T) {
 	}
 	remoteIPv4Addr1 := tcpip.Address(net.ParseIP("10.0.0.2").To4())
 	remoteIPv4Addr2 := tcpip.Address(net.ParseIP("11.0.0.2").To4())
+	unreachableIPv4Addr := tcpip.Address(net.ParseIP("12.0.0.2").To4())
+
+	// In order for the test assertions below to hold, this MTU should be:
+	//
+	//   1) Greater than or equal to the maximum ICMP packet size (576
+	//      bytes). The reason is that while computing the size of the
+	//      payload of the returned ICMP error packet, we assume that
+	//      the packet size isn't constrained by the MTU.
+	//   2) Well below `ipv4.MaxTotalSize`. The reason is that we need the
+	//      original packet's size to exceed the MTU, which is only possible
+	//      if the MTU is less than the maximum length of an IPv4 packet.
+	reducedMTU := 1000
 
 	tests := []struct {
 		name             string
 		TTL              uint8
+		destAddr         tcpip.Address
+		ipFlags          int
+		mtu              int
+		payloadLength    int
 		expectErrorICMP  bool
 		options          header.IPv4Options
 		forwardedOptions header.IPv4Options
@@ -144,6 +160,8 @@ func TestForwarding(t *testing.T) {
 		{
 			name:            "TTL of zero",
 			TTL:             0,
+			destAddr:        remoteIPv4Addr2,
+			mtu:             ipv4.MaxTotalSize,
 			expectErrorICMP: true,
 			icmpType:        header.ICMPv4TimeExceeded,
 			icmpCode:        header.ICMPv4TTLExceeded,
@@ -151,28 +169,38 @@ func TestForwarding(t *testing.T) {
 		{
 			name:            "TTL of one",
 			TTL:             1,
+			destAddr:        remoteIPv4Addr2,
+			mtu:             ipv4.MaxTotalSize,
 			expectErrorICMP: false,
 		},
 		{
 			name:            "TTL of two",
 			TTL:             2,
+			destAddr:        remoteIPv4Addr2,
+			mtu:             ipv4.MaxTotalSize,
 			expectErrorICMP: false,
 		},
 		{
 			name:            "Max TTL",
 			TTL:             math.MaxUint8,
+			destAddr:        remoteIPv4Addr2,
+			mtu:             ipv4.MaxTotalSize,
 			expectErrorICMP: false,
 		},
 		{
 			name:             "four EOL options",
 			TTL:              2,
+			destAddr:         remoteIPv4Addr2,
+			mtu:              ipv4.MaxTotalSize,
 			expectErrorICMP:  false,
 			options:          header.IPv4Options{0, 0, 0, 0},
 			forwardedOptions: header.IPv4Options{0, 0, 0, 0},
 		},
 		{
-			name: "TS type 1 full",
-			TTL:  2,
+			name:     "TS type 1 full",
+			TTL:      2,
+			destAddr: remoteIPv4Addr2,
+			mtu:      ipv4.MaxTotalSize,
 			options: header.IPv4Options{
 				68, 12, 13, 0xF1,
 				192, 168, 1, 12,
@@ -183,8 +211,10 @@ func TestForwarding(t *testing.T) {
 			icmpCode:        header.ICMPv4UnusedCode,
 		},
 		{
-			name: "TS type 0",
-			TTL:  2,
+			name:     "TS type 0",
+			TTL:      2,
+			destAddr: remoteIPv4Addr2,
+			mtu:      ipv4.MaxTotalSize,
 			options: header.IPv4Options{
 				68, 24, 21, 0x00,
 				1, 2, 3, 4,
@@ -203,8 +233,10 @@ func TestForwarding(t *testing.T) {
 			},
 		},
 		{
-			name: "end of options list",
-			TTL:  2,
+			name:     "end of options list",
+			TTL:      2,
+			destAddr: remoteIPv4Addr2,
+			mtu:      ipv4.MaxTotalSize,
 			options: header.IPv4Options{
 				68, 12, 13, 0x11,
 				192, 168, 1, 12,
@@ -221,6 +253,34 @@ func TestForwarding(t *testing.T) {
 				0, 0, 0, 0,
 			},
 		},
+		{
+			name:            "Network unreachable",
+			TTL:             2,
+			destAddr:        unreachableIPv4Addr,
+			mtu:             ipv4.MaxTotalSize,
+			expectErrorICMP: true,
+			icmpType:        header.ICMPv4DstUnreachable,
+			icmpCode:        header.ICMPv4NetUnreachable,
+		},
+		{
+			name:            "Fragmentation needed and DF set",
+			TTL:             2,
+			destAddr:        remoteIPv4Addr2,
+			ipFlags:         header.IPv4FlagDontFragment,
+			mtu:             reducedMTU,
+			payloadLength:   reducedMTU + 1,
+			expectErrorICMP: true,
+			icmpType:        header.ICMPv4DstUnreachable,
+			icmpCode:        header.ICMPv4FragmentationNeeded,
+		},
+		{
+			name:            "Fragmentation needed and DF not set",
+			TTL:             2,
+			destAddr:        remoteIPv4Addr2,
+			mtu:             reducedMTU,
+			payloadLength:   reducedMTU + 1,
+			expectErrorICMP: false,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -236,7 +296,7 @@ func TestForwarding(t *testing.T) {
 			clock.Advance(time.Millisecond * randomTimeOffset)
 
 			// We expect at most a single packet in response to our ICMP Echo Request.
-			e1 := channel.New(1, ipv4.MaxTotalSize, "")
+			e1 := channel.New(1, uint32(test.mtu), "")
 			if err := s.CreateNIC(nicID1, e1); err != nil {
 				t.Fatalf("CreateNIC(%d, _): %s", nicID1, err)
 			}
@@ -245,7 +305,7 @@ func TestForwarding(t *testing.T) {
 				t.Fatalf("AddProtocolAddress(%d, %#v): %s", nicID1, ipv4ProtoAddr1, err)
 			}
 
-			e2 := channel.New(1, ipv4.MaxTotalSize, "")
+			e2 := channel.New(1, uint32(test.mtu), "")
 			if err := s.CreateNIC(nicID2, e2); err != nil {
 				t.Fatalf("CreateNIC(%d, _): %s", nicID2, err)
 			}
@@ -273,9 +333,11 @@ func TestForwarding(t *testing.T) {
 			if ipHeaderLength > header.IPv4MaximumHeaderSize {
 				t.Fatalf("got ipHeaderLength = %d, want <= %d ", ipHeaderLength, header.IPv4MaximumHeaderSize)
 			}
-			totalLen := uint16(ipHeaderLength + header.ICMPv4MinimumSize)
-			hdr := buffer.NewPrependable(int(totalLen))
-			icmp := header.ICMPv4(hdr.Prepend(header.ICMPv4MinimumSize))
+			icmpHeaderLength := header.ICMPv4MinimumSize
+			totalLength := ipHeaderLength + icmpHeaderLength + test.payloadLength
+			hdr := buffer.NewPrependable(totalLength)
+			hdr.Prepend(test.payloadLength)
+			icmp := header.ICMPv4(hdr.Prepend(icmpHeaderLength))
 			icmp.SetIdent(randomIdent)
 			icmp.SetSequence(randomSequence)
 			icmp.SetType(header.ICMPv4Echo)
@@ -284,11 +346,12 @@ func TestForwarding(t *testing.T) {
 			icmp.SetChecksum(^header.Checksum(icmp, 0))
 			ip := header.IPv4(hdr.Prepend(ipHeaderLength))
 			ip.Encode(&header.IPv4Fields{
-				TotalLength: totalLen,
+				TotalLength: uint16(totalLength),
 				Protocol:    uint8(header.ICMPv4ProtocolNumber),
 				TTL:         test.TTL,
 				SrcAddr:     remoteIPv4Addr1,
-				DstAddr:     remoteIPv4Addr2,
+				DstAddr:     test.destAddr,
+				Flags:       uint8(test.ipFlags),
 			})
 			if len(test.options) != 0 {
 				ip.SetHeaderLength(uint8(ipHeaderLength))
@@ -311,6 +374,17 @@ func TestForwarding(t *testing.T) {
 					t.Fatalf("expected ICMP packet type %d through incoming NIC", test.icmpType)
 				}
 
+				// We expect the ICMP packet to contain as much of the original packet as possible
+				// up to a limit of 576 bytes, split between payload, IP header, and ICMP header.
+				expectedICMPPayloadLength := func() int {
+					maxICMPPacketLength := header.IPv4MinimumProcessableDatagramSize
+					maxICMPPayloadLength := maxICMPPacketLength - icmpHeaderLength - ipHeaderLength
+					if len(hdr.View()) > maxICMPPayloadLength {
+						return maxICMPPayloadLength
+					}
+					return len(hdr.View())
+				}
+
 				checker.IPv4(t, header.IPv4(stack.PayloadSince(reply.Pkt.NetworkHeader())),
 					checker.SrcAddr(ipv4Addr1.Address),
 					checker.DstAddr(remoteIPv4Addr1),
@@ -319,7 +393,7 @@ func TestForwarding(t *testing.T) {
 						checker.ICMPv4Checksum(),
 						checker.ICMPv4Type(test.icmpType),
 						checker.ICMPv4Code(test.icmpCode),
-						checker.ICMPv4Payload([]byte(hdr.View())),
+						checker.ICMPv4Payload([]byte(hdr.View()[0:expectedICMPPayloadLength()])),
 					),
 				)
 
@@ -341,7 +415,6 @@ func TestForwarding(t *testing.T) {
 						checker.ICMPv4Checksum(),
 						checker.ICMPv4Type(header.ICMPv4Echo),
 						checker.ICMPv4Code(header.ICMPv4UnusedCode),
-						checker.ICMPv4Payload(nil),
 					),
 				)
 

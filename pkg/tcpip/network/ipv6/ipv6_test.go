@@ -3036,36 +3036,67 @@ func TestForwarding(t *testing.T) {
 	}
 	remoteIPv6Addr1 := tcpip.Address(net.ParseIP("10::2").To16())
 	remoteIPv6Addr2 := tcpip.Address(net.ParseIP("11::2").To16())
+	unreachableIPv6Addr := tcpip.Address(net.ParseIP("12::2").To16())
 
 	tests := []struct {
 		name            string
 		TTL             uint8
+		payloadLength   int
 		expectErrorICMP bool
+		destAddr        tcpip.Address
+		icmpType        header.ICMPv6Type
+		icmpCode        header.ICMPv6Code
 	}{
 		{
 			name:            "TTL of zero",
 			TTL:             0,
 			expectErrorICMP: true,
+			destAddr:        remoteIPv6Addr2,
+			icmpType:        header.ICMPv6TimeExceeded,
+			icmpCode:        header.ICMPv6HopLimitExceeded,
 		},
 		{
 			name:            "TTL of one",
 			TTL:             1,
 			expectErrorICMP: true,
+			destAddr:        remoteIPv6Addr2,
+			icmpType:        header.ICMPv6TimeExceeded,
+			icmpCode:        header.ICMPv6HopLimitExceeded,
 		},
 		{
 			name:            "TTL of two",
 			TTL:             2,
 			expectErrorICMP: false,
+			destAddr:        remoteIPv6Addr2,
 		},
 		{
 			name:            "TTL of three",
 			TTL:             3,
 			expectErrorICMP: false,
+			destAddr:        remoteIPv6Addr2,
 		},
 		{
 			name:            "Max TTL",
 			TTL:             math.MaxUint8,
 			expectErrorICMP: false,
+			destAddr:        remoteIPv6Addr2,
+		},
+		{
+			name:            "Network unreachable",
+			TTL:             2,
+			expectErrorICMP: true,
+			destAddr:        unreachableIPv6Addr,
+			icmpType:        header.ICMPv6DstUnreachable,
+			icmpCode:        header.ICMPv6NetworkUnreachable,
+		},
+		{
+			name:            "Can't fragment",
+			TTL:             2,
+			payloadLength:   header.IPv6MinimumMTU + 1,
+			expectErrorICMP: true,
+			destAddr:        remoteIPv6Addr2,
+			icmpType:        header.ICMPv6PacketTooBig,
+			icmpCode:        header.ICMPv6UnusedCode,
 		},
 	}
 
@@ -3108,9 +3139,12 @@ func TestForwarding(t *testing.T) {
 			if err := s.SetForwarding(ProtocolNumber, true); err != nil {
 				t.Fatalf("SetForwarding(%d, true): %s", ProtocolNumber, err)
 			}
-
-			hdr := buffer.NewPrependable(header.IPv6MinimumSize + header.ICMPv6MinimumSize)
-			icmp := header.ICMPv6(hdr.Prepend(header.ICMPv6MinimumSize))
+			ipHeaderLength := header.IPv6MinimumSize
+			icmpHeaderLength := header.ICMPv6MinimumSize
+			totalLength := ipHeaderLength + icmpHeaderLength + test.payloadLength
+			hdr := buffer.NewPrependable(totalLength)
+			hdr.Prepend(test.payloadLength)
+			icmp := header.ICMPv6(hdr.Prepend(icmpHeaderLength))
 			icmp.SetIdent(randomIdent)
 			icmp.SetSequence(randomSequence)
 			icmp.SetType(header.ICMPv6EchoRequest)
@@ -3119,15 +3153,15 @@ func TestForwarding(t *testing.T) {
 			icmp.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
 				Header: icmp,
 				Src:    remoteIPv6Addr1,
-				Dst:    remoteIPv6Addr2,
+				Dst:    test.destAddr,
 			}))
-			ip := header.IPv6(hdr.Prepend(header.IPv6MinimumSize))
+			ip := header.IPv6(hdr.Prepend(ipHeaderLength))
 			ip.Encode(&header.IPv6Fields{
-				PayloadLength:     header.ICMPv6MinimumSize,
+				PayloadLength:     uint16(header.ICMPv6MinimumSize + test.payloadLength),
 				TransportProtocol: header.ICMPv6ProtocolNumber,
 				HopLimit:          test.TTL,
 				SrcAddr:           remoteIPv6Addr1,
-				DstAddr:           remoteIPv6Addr2,
+				DstAddr:           test.destAddr,
 			})
 			requestPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 				Data: hdr.View().ToVectorisedView(),
@@ -3137,7 +3171,19 @@ func TestForwarding(t *testing.T) {
 			if test.expectErrorICMP {
 				reply, ok := e1.Read()
 				if !ok {
-					t.Fatal("expected ICMP Hop Limit Exceeded packet through incoming NIC")
+					t.Fatalf("expected ICMP packet type %d through incoming NIC", test.icmpType)
+				}
+
+				// As per RFC 4443, page 9:
+				//
+				//   "The returned ICMP packet will contain "as much of invoking packet as possible
+				//    without the ICMPv6 packet exceeding the minimum IPv6 MTU."
+				expectedICMPPayloadLength := func() int {
+					maxICMPPayloadLength := header.IPv6MinimumMTU - ipHeaderLength - icmpHeaderLength
+					if len(hdr.View()) > maxICMPPayloadLength {
+						return maxICMPPayloadLength
+					}
+					return len(hdr.View())
 				}
 
 				checker.IPv6(t, header.IPv6(stack.PayloadSince(reply.Pkt.NetworkHeader())),
@@ -3145,9 +3191,9 @@ func TestForwarding(t *testing.T) {
 					checker.DstAddr(remoteIPv6Addr1),
 					checker.TTL(DefaultTTL),
 					checker.ICMPv6(
-						checker.ICMPv6Type(header.ICMPv6TimeExceeded),
-						checker.ICMPv6Code(header.ICMPv6HopLimitExceeded),
-						checker.ICMPv6Payload([]byte(hdr.View())),
+						checker.ICMPv6Type(test.icmpType),
+						checker.ICMPv6Code(test.icmpCode),
+						checker.ICMPv6Payload([]byte(hdr.View()[0:expectedICMPPayloadLength()])),
 					),
 				)
 

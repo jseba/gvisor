@@ -433,6 +433,10 @@ func (e *endpoint) writePacket(r *stack.Route, gso *stack.GSO, pkt *stack.Packet
 	}
 
 	if packetMustBeFragmented(pkt, networkMTU, gso) {
+		h := header.IPv4(pkt.NetworkHeader().View())
+		if h.Flags()&header.IPv4FlagDontFragment != 0 {
+			return &tcpip.ErrCantFragment{}
+		}
 		sent, remain, err := e.handleFragments(r, gso, networkMTU, pkt, func(fragPkt *stack.PacketBuffer) tcpip.Error {
 			// TODO(gvisor.dev/issue/3884): Evaluate whether we want to send each
 			// fragment one by one using WritePacket() (current strategy) or if we
@@ -662,7 +666,11 @@ func (e *endpoint) forwardPacket(pkt *stack.PacketBuffer) tcpip.Error {
 	}
 
 	r, err := e.protocol.stack.FindRoute(0, "", dstAddr, ProtocolNumber, false /* multicastLoop */)
-	if err != nil {
+	switch err.(type) {
+	case nil:
+	case *tcpip.ErrNoRoute:
+		return e.protocol.returnError(&icmpReasonNetworkUnreachable{}, pkt)
+	default:
 		return err
 	}
 	defer r.Release()
@@ -680,10 +688,20 @@ func (e *endpoint) forwardPacket(pkt *stack.PacketBuffer) tcpip.Error {
 	//   spent, the field must be decremented by 1.
 	newHdr.SetTTL(ttl - 1)
 
-	return r.WriteHeaderIncludedPacket(stack.NewPacketBuffer(stack.PacketBufferOptions{
+	result := r.WriteHeaderIncludedPacket(stack.NewPacketBuffer(stack.PacketBufferOptions{
 		ReserveHeaderBytes: int(r.MaxHeaderLength()),
 		Data:               buffer.View(newHdr).ToVectorisedView(),
 	}))
+
+	switch result.(type) {
+	case *tcpip.ErrCantFragment:
+		// If the packet can't fit within the endpoint's MTU but its
+		// header has Don't Fragment set, we should return an ICMP
+		// error (see RFC 792, page 4).
+		return e.protocol.returnError(&icmpReasonCantFragment{}, pkt)
+	default:
+		return result
+	}
 }
 
 // HandlePacket is called by the link layer when new ipv4 packets arrive for
