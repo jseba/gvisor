@@ -26,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/seqnum"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 const (
@@ -268,7 +269,7 @@ func newSender(ep *endpoint, iss, irs seqnum.Value, sndWnd seqnum.Size, mss uint
 			highRxt:   iss,
 			rescueRxt: iss,
 		},
-		gso: ep.gso != nil,
+		gso: ep.gso.Type != stack.GSONone,
 	}
 
 	if s.gso {
@@ -918,7 +919,7 @@ func (s *sender) maybeSendSegment(seg *segment, limit int, end seqnum.Value) (se
 		// If GSO is not in use then cap available to
 		// maxPayloadSize. When GSO is in use the gVisor GSO logic or
 		// the host GSO logic will cap the segment to the correct size.
-		if s.ep.gso == nil && available > s.maxPayloadSize {
+		if s.ep.gso.Type == stack.GSONone && available > s.maxPayloadSize {
 			available = s.maxPayloadSize
 		}
 
